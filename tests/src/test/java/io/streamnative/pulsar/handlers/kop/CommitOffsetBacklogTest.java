@@ -180,7 +180,7 @@ public class CommitOffsetBacklogTest extends KopProtocolHandlerTestBase {
             ConsumerRecords<Integer, String> records = kConsumerA.getConsumer().poll(Duration.ofMillis(200));
             for (ConsumerRecord<Integer, String> record : records) {
                 if (log.isDebugEnabled()) {
-                    log.debug("Kafka Consumer Received message: {}, {} at offset {}",
+                    log.debug("Kafka ConsumerA Received message: {}, {} at offset {}",
                         record.key(), record.value(), record.offset());
                 }
                 i++;
@@ -195,7 +195,7 @@ public class CommitOffsetBacklogTest extends KopProtocolHandlerTestBase {
             ConsumerRecords<Integer, String> records = kConsumerB.getConsumer().poll(Duration.ofMillis(200));
             for (ConsumerRecord<Integer, String> record : records) {
                 if (log.isDebugEnabled()) {
-                    log.debug("Kafka Consumer Received message: {}, {} at offset {}",
+                    log.debug("Kafka ConsumerB Received message: {}, {} at offset {}",
                         record.key(), record.value(), record.offset());
                 }
                 i++;
@@ -225,6 +225,9 @@ public class CommitOffsetBacklogTest extends KopProtocolHandlerTestBase {
         }
         kConsumerA.getConsumer().commitSync();
         kConsumerB.getConsumer().commitSync();
+
+        // wait for offsetAcker ack finished
+        Thread.sleep(3000);
         verifyBacklogInTopicStats(topicRef, 0);
     }
 

@@ -13,7 +13,6 @@
  */
 package io.streamnative.pulsar.handlers.kop;
 
-import static io.streamnative.pulsar.handlers.kop.KafkaProtocolHandler.PLAINTEXT_PREFIX;
 import static org.apache.kafka.common.internals.Topic.GROUP_METADATA_TOPIC_NAME;
 import static org.apache.pulsar.common.naming.TopicName.PARTITIONED_TOPIC_SUFFIX;
 import static org.testng.Assert.assertEquals;
@@ -335,11 +334,11 @@ public class DistributedClusterTest extends KopProtocolHandlerTestBase {
             topicMap.get(result).add(topicName);
             log.info("serving broker for topic {} is {}", topicName, result);
         }
-        assertTrue(topicMap.size() == 2);
+        assertEquals(topicMap.size(), 2);
 
         final AtomicInteger numberTopic2 = new AtomicInteger(0);
         topicMap.values().stream().forEach(list -> numberTopic2.addAndGet(list.size()));
-        assertTrue(numberTopic2.get() == partitionNumber);
+        assertEquals(numberTopic2.get(), partitionNumber);
 
         offsetTopicMap = Maps.newHashMap();
         for (int ii = 0; ii < offsetsTopicNumPartitions; ii++) {
@@ -417,7 +416,7 @@ public class DistributedClusterTest extends KopProtocolHandlerTestBase {
             topicMap.get(result).add(topicName);
             log.info("serving broker for topic {} is {}", topicName, result);
         }
-        assertTrue(topicMap.size() == 2);
+        assertEquals(topicMap.size(), 2);
 
         // 2. produce consume message with Kafka producer.
         int totalMsgs = 50;
@@ -466,7 +465,7 @@ public class DistributedClusterTest extends KopProtocolHandlerTestBase {
             topicMap.get(result).add(topicName);
             log.info("serving broker for topic {} is {}", topicName, result);
         }
-        assertTrue(topicMap.size() == 2);
+        assertEquals(topicMap.size(), 2);
 
         // 2. produce consume message with Kafka producer.
         int totalMsgs = 50;

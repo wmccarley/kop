@@ -27,6 +27,8 @@ import java.nio.ByteBuffer;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.naming.AuthenticationException;
+
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.common.errors.LeaderNotAvailableException;
@@ -148,12 +150,21 @@ public abstract class KafkaCommandDecoder extends ChannelInboundHandlerAdapter {
             }
 
             CompletableFuture<AbstractResponse> responseFuture = new CompletableFuture<>();
+            responseFuture.whenComplete((response, e) -> {
+                ctx.channel().eventLoop().execute(() -> {
+                    writeAndFlushResponseToClient(channel);
+                });
+            });
 
             requestsQueue.add(ResponseAndRequest.of(responseFuture, kafkaHeaderAndRequest));
 
             if (!isActive.get()) {
                 handleInactive(kafkaHeaderAndRequest, responseFuture);
             } else {
+                if (!hasAuthenticated(kafkaHeaderAndRequest)) {
+                    authenticate(kafkaHeaderAndRequest, responseFuture);
+                    return;
+                }
                 switch (kafkaHeaderAndRequest.getHeader().apiKey()) {
                     case API_VERSIONS:
                         handleApiVersionsRequest(kafkaHeaderAndRequest, responseFuture);
@@ -208,14 +219,40 @@ public abstract class KafkaCommandDecoder extends ChannelInboundHandlerAdapter {
                     case SASL_AUTHENTICATE:
                         handleSaslAuthenticate(kafkaHeaderAndRequest, responseFuture);
                         break;
+                    case CREATE_TOPICS:
+                        handleCreateTopics(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case INIT_PRODUCER_ID:
+                        handleInitProducerId(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case ADD_PARTITIONS_TO_TXN:
+                        handleAddPartitionsToTxn(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case ADD_OFFSETS_TO_TXN:
+                        handleAddOffsetsToTxn(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case TXN_OFFSET_COMMIT:
+                        handleTxnOffsetCommit(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case END_TXN:
+                        handleEndTxn(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case WRITE_TXN_MARKERS:
+                        handleWriteTxnMarkers(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case DESCRIBE_CONFIGS:
+                        handleDescribeConfigs(kafkaHeaderAndRequest, responseFuture);
+                        break;
+                    case DELETE_TOPICS:
+                        handleDeleteTopics(kafkaHeaderAndRequest, responseFuture);
+                        break;
                     default:
                         handleError(kafkaHeaderAndRequest, responseFuture);
                 }
             }
-
-            responseFuture.whenComplete((response, e) -> {
-                writeAndFlushResponseToClient(channel);
-            });
+        } catch (AuthenticationException e) {
+            log.error("unexpected error in authenticate:", e);
+            close();
         } catch (Exception e) {
             log.error("error while handle command:", e);
             close();
@@ -277,6 +314,12 @@ public abstract class KafkaCommandDecoder extends ChannelInboundHandlerAdapter {
         }
     }
 
+    protected abstract boolean hasAuthenticated(KafkaHeaderAndRequest kafkaHeaderAndRequest);
+
+    protected abstract void
+    authenticate(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response)
+            throws AuthenticationException;
+
     protected abstract void
     handleError(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
 
@@ -333,6 +376,33 @@ public abstract class KafkaCommandDecoder extends ChannelInboundHandlerAdapter {
 
     protected abstract void
     handleSaslHandshake(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleCreateTopics(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleDescribeConfigs(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleInitProducerId(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleAddPartitionsToTxn(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleAddOffsetsToTxn(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleTxnOffsetCommit(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleEndTxn(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleWriteTxnMarkers(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
+
+    protected abstract void
+    handleDeleteTopics(KafkaHeaderAndRequest kafkaHeaderAndRequest, CompletableFuture<AbstractResponse> response);
 
     static class KafkaHeaderAndRequest implements Closeable {
 

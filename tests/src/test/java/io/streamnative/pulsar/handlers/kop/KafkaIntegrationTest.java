@@ -26,27 +26,30 @@
  */
 package io.streamnative.pulsar.handlers.kop;
 
-import static io.streamnative.pulsar.handlers.kop.KafkaProtocolHandler.PLAINTEXT_PREFIX;
-import static io.streamnative.pulsar.handlers.kop.KafkaProtocolHandler.SSL_PREFIX;
 import static org.testng.AssertJUnit.assertFalse;
 import static org.testng.AssertJUnit.assertTrue;
 
 import com.google.common.collect.Sets;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.util.Enumeration;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.RetentionPolicies;
 import org.apache.pulsar.common.policies.data.TenantInfo;
-import org.junit.AfterClass;
 import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.output.WaitingConsumer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
+import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.DataProvider;
+import org.testng.annotations.Factory;
 import org.testng.annotations.Test;
 
 /**
@@ -73,6 +76,18 @@ import org.testng.annotations.Test;
 @Slf4j
 public class KafkaIntegrationTest extends KopProtocolHandlerTestBase {
 
+    public KafkaIntegrationTest(final String entryFormat) {
+        super(entryFormat);
+    }
+
+    @Factory
+    public static Object[] instances() {
+        return new Object[] {
+                new KafkaIntegrationTest("pulsar"),
+                new KafkaIntegrationTest("kafka")
+        };
+    }
+
     @DataProvider
     public static Object[][] integrations() {
         return new Object[][]{
@@ -84,7 +99,35 @@ public class KafkaIntegrationTest extends KopProtocolHandlerTestBase {
                 // consumer is broken, see integrations/README.md
                 {"node-kafka-node", Optional.empty(), true, false},
                 {"node-rdkafka", Optional.empty(), true, true},
+                {"kafka-client-1.0.0", Optional.empty(), true, true},
+                {"kafka-client-1.1.0", Optional.empty(), true, true},
+                {"kafka-client-2.0.0", Optional.empty(), true, true},
+                {"kafka-client-2.1.0", Optional.empty(), true, true},
+                {"kafka-client-2.2.0", Optional.empty(), true, true},
+                {"kafka-client-2.3.0", Optional.empty(), true, true},
+                {"kafka-client-2.4.0", Optional.empty(), true, true},
+                {"kafka-client-2.5.0", Optional.empty(), true, true},
+                {"kafka-client-2.6.0", Optional.empty(), true, true},
         };
+    }
+
+    public static String getSiteLocalAddress() throws UnknownHostException {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface networkInterface = interfaces.nextElement();
+                Enumeration<InetAddress> addresses = networkInterface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress address = addresses.nextElement();
+                    if (address.isSiteLocalAddress()) {
+                        return address.getHostAddress();
+                    }
+                }
+            }
+        } catch (SocketException e) {
+            log.warn("getSiteLocalAddress failed: {}, use local address instead", e.getMessage());
+        }
+        return InetAddress.getLocalHost().getHostAddress();
     }
 
     private static WaitingConsumer createLogFollower(final GenericContainer container) {
@@ -113,17 +156,18 @@ public class KafkaIntegrationTest extends KopProtocolHandlerTestBase {
     @BeforeClass
     @Override
     protected void setup() throws Exception {
-
         super.resetConfig();
+        this.conf.setEnableTransactionCoordinator(true);
         // in order to access PulsarBroker when using Docker for Mac, we need to adjust things:
         // - set pulsar advertized address to host IP
         // - use the `host.testcontainers.internal` address exposed by testcontainers
-        String ip = InetAddress.getLocalHost().getHostAddress();
-        System.out.println("exposing Pulsar broker on " + ip);
-        conf.setAdvertisedAddress(ip);
+        final String ip = getSiteLocalAddress();
+        System.out.println("Bind Pulsar broker/KoP on " + ip);
         ((KafkaServiceConfiguration) conf).setListeners(
                 PLAINTEXT_PREFIX + ip + ":" + kafkaBrokerPort + ","
                         + SSL_PREFIX + ip + ":" + kafkaBrokerPortTls);
+        conf.setKafkaAdvertisedListeners(PLAINTEXT_PREFIX + "127.0.0.1:" + kafkaBrokerPort
+                + "," + SSL_PREFIX + "127.0.0.1:" + kafkaBrokerPortTls);
         super.internalSetup();
 
 
@@ -173,7 +217,8 @@ public class KafkaIntegrationTest extends KopProtocolHandlerTestBase {
                 .withEnv("KOP_PRODUCE", "true")
                 .withEnv("KOP_TOPIC", topic.orElse(integration))
                 .withEnv("KOP_LIMIT", "10")
-                .withLogConsumer(new org.testcontainers.containers.output.Slf4jLogConsumer(KafkaIntegrationTest.log))
+                .withLogConsumer(
+                        new org.testcontainers.containers.output.Slf4jLogConsumer(KafkaIntegrationTest.log))
                 .waitingFor(Wait.forLogMessage("starting to produce\\n", 1))
                 .withNetworkMode("host");
 
@@ -182,7 +227,8 @@ public class KafkaIntegrationTest extends KopProtocolHandlerTestBase {
                 .withEnv("KOP_TOPIC", topic.orElse(integration))
                 .withEnv("KOP_CONSUME", "true")
                 .withEnv("KOP_LIMIT", "10")
-                .withLogConsumer(new org.testcontainers.containers.output.Slf4jLogConsumer(KafkaIntegrationTest.log))
+                .withLogConsumer(
+                        new org.testcontainers.containers.output.Slf4jLogConsumer(KafkaIntegrationTest.log))
                 .waitingFor(Wait.forLogMessage("starting to consume\\n", 1))
                 .withNetworkMode("host");
 
@@ -213,8 +259,8 @@ public class KafkaIntegrationTest extends KopProtocolHandlerTestBase {
         }
     }
 
-    @Override
     @AfterClass
+    @Override
     protected void cleanup() throws Exception {
         super.internalCleanup();
     }

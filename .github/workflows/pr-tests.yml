@@ -1,4 +1,4 @@
-name: kop mvn build check and ut
+name: kop tests
 
 on:
   pull_request:
@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - master
+      - branch-*
 
 jobs:
   build:
@@ -20,26 +21,11 @@ jobs:
       with:
         java-version: 1.8
 
-    - name: License check
-      run: mvn license:check
-
     - name: Build with Maven skipTests
       run: mvn clean install -DskipTests
 
-    - name: Style check
-      run: mvn checkstyle:check
-
-    - name: Spotbugs check
-      run: mvn spotbugs:check
-
-    - name: test after build
-      run: mvn test -DfailIfNoTests=false '-Dtest=!KafkaIntegrationTest,!DistributedClusterTest'
-
-    - name: KafkaIntegrationTest
-      run: mvn test '-Dtest=KafkaIntegrationTest' -pl tests
-
-    - name: DistributedClusterTest
-      run: mvn test '-Dtest=DistributedClusterTest' -pl tests
+    - name: tests module
+      run: mvn test -DfailIfNoTests=false '-Dtest=!KafkaIntegration*Test,!DistributedClusterTest' -pl tests
 
     - name: package surefire artifacts
       if: failure()

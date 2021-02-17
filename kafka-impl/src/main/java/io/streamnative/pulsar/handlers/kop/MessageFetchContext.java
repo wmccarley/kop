@@ -13,58 +13,61 @@
  */
 package io.streamnative.pulsar.handlers.kop;
 
-import static io.streamnative.pulsar.handlers.kop.utils.MessageRecordUtils.entriesToRecords;
-import static io.streamnative.pulsar.handlers.kop.utils.TopicNameUtils.pulsarTopicName;
 import static org.apache.kafka.common.protocol.CommonFields.THROTTLE_TIME_MS;
 
 import com.google.common.collect.Lists;
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
 import io.streamnative.pulsar.handlers.kop.KafkaCommandDecoder.KafkaHeaderAndRequest;
+import io.streamnative.pulsar.handlers.kop.coordinator.transaction.TransactionCoordinator;
+import io.streamnative.pulsar.handlers.kop.format.EntryFormatter;
+import io.streamnative.pulsar.handlers.kop.utils.KopTopic;
 import io.streamnative.pulsar.handlers.kop.utils.MessageIdUtils;
+import io.streamnative.pulsar.handlers.kop.utils.ZooKeeperUtils;
+
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.MarkDeleteCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.ReadEntriesCallback;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.ManagedCursor;
 import org.apache.bookkeeper.mledger.ManagedLedgerException;
+import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
 import org.apache.bookkeeper.mledger.impl.NonDurableCursorImpl;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.requests.AbstractResponse;
 import org.apache.kafka.common.requests.FetchRequest;
 import org.apache.kafka.common.requests.FetchResponse;
 import org.apache.kafka.common.requests.FetchResponse.PartitionData;
+import org.apache.kafka.common.requests.IsolationLevel;
+import org.apache.pulsar.broker.service.Consumer;
 import org.apache.pulsar.common.naming.TopicName;
 
 /**
- * MessageFetchContext handling FetchRequest .
+ * MessageFetchContext handling FetchRequest.
  */
 @Slf4j
 public final class MessageFetchContext {
 
     private KafkaRequestHandler requestHandler;
-    private KafkaHeaderAndRequest fetchRequest;
 
     // recycler and get for this object
-    public static MessageFetchContext get(KafkaRequestHandler requestHandler,
-                                          KafkaHeaderAndRequest fetchRequest) {
+    public static MessageFetchContext get(KafkaRequestHandler requestHandler) {
         MessageFetchContext context = RECYCLER.get();
         context.requestHandler = requestHandler;
-        context.fetchRequest = fetchRequest;
         return context;
     }
 
@@ -82,13 +85,15 @@ public final class MessageFetchContext {
 
     public void recycle() {
         requestHandler = null;
-        fetchRequest = null;
         recyclerHandle.recycle(this);
     }
 
 
     // handle request
-    public CompletableFuture<AbstractResponse> handleFetch(CompletableFuture<AbstractResponse> fetchResponse) {
+    public CompletableFuture<AbstractResponse> handleFetch(
+            CompletableFuture<AbstractResponse> fetchResponse,
+            KafkaHeaderAndRequest fetchRequest,
+            TransactionCoordinator transactionCoordinator) {
         LinkedHashMap<TopicPartition, PartitionData<MemoryRecords>> responseData = new LinkedHashMap<>();
 
         // Map of partition and related tcm.
@@ -96,10 +101,8 @@ public final class MessageFetchContext {
             ((FetchRequest) fetchRequest.getRequest())
                 .fetchData().entrySet().stream()
                 .map(entry -> {
-                    TopicName topicName = pulsarTopicName(entry.getKey(), requestHandler.getNamespace());
-
                     CompletableFuture<KafkaTopicConsumerManager> consumerManager =
-                        requestHandler.getTopicManager().getTopicConsumerManager(topicName.toString());
+                        requestHandler.getTopicManager().getTopicConsumerManager(KopTopic.toString(entry.getKey()));
 
                     return Pair.of(
                         entry.getKey(),
@@ -119,6 +122,9 @@ public final class MessageFetchContext {
                                 // all future completed now.
                                 tcm = pair.getValue().get();
                                 if (tcm == null) {
+                                    // remove null future cache from consumerTopicManagers
+                                    requestHandler.getTopicManager().getConsumerTopicManagers()
+                                            .remove(KopTopic.toString(pair.getKey()));
                                     throw new NullPointerException("topic not owned, and return null TCM in fetch.");
                                 }
                             } catch (Exception e) {
@@ -140,8 +146,8 @@ public final class MessageFetchContext {
                                 .get(pair.getKey()).fetchOffset;
 
                             if (log.isDebugEnabled()) {
-                                log.debug("Fetch for {}: remove tcm to get cursor for fetch offset: {} - {}.",
-                                    pair.getKey(), offset, MessageIdUtils.getPosition(offset));
+                                log.debug("Fetch for {}: remove tcm to get cursor for fetch offset: {} .",
+                                    pair.getKey(), offset);
                             }
 
                             Pair<ManagedCursor, Long> cursorLongPair = tcm.remove(offset);
@@ -167,7 +173,7 @@ public final class MessageFetchContext {
                         .filter(x -> x != null)
                         .collect(Collectors.toMap(Pair::getKey, Pair::getValue));
 
-                readMessages(fetchRequest, partitionCursor, fetchResponse, responseData);
+                readMessages(fetchRequest, partitionCursor, fetchResponse, responseData, transactionCoordinator);
             });
 
         return fetchResponse;
@@ -179,11 +185,12 @@ public final class MessageFetchContext {
     private void readMessages(KafkaHeaderAndRequest fetch,
                               Map<TopicPartition, Pair<ManagedCursor, Long>> cursors,
                               CompletableFuture<AbstractResponse> resultFuture,
-                              LinkedHashMap<TopicPartition, PartitionData<MemoryRecords>> responseData) {
+                              LinkedHashMap<TopicPartition, PartitionData<MemoryRecords>> responseData,
+                              TransactionCoordinator tc) {
         AtomicInteger bytesRead = new AtomicInteger(0);
         Map<TopicPartition, List<Entry>> entryValues = new ConcurrentHashMap<>();
 
-        readMessagesInternal(fetch, cursors, bytesRead, entryValues, resultFuture, responseData);
+        readMessagesInternal(fetch, cursors, bytesRead, entryValues, resultFuture, responseData, tc);
     }
 
     private void readMessagesInternal(KafkaHeaderAndRequest fetch,
@@ -191,28 +198,49 @@ public final class MessageFetchContext {
                                       AtomicInteger bytesRead,
                                       Map<TopicPartition, List<Entry>> responseValues,
                                       CompletableFuture<AbstractResponse> resultFuture,
-                                      LinkedHashMap<TopicPartition, PartitionData<MemoryRecords>> responseData) {
+                                      LinkedHashMap<TopicPartition, PartitionData<MemoryRecords>> responseData,
+                                      TransactionCoordinator tc) {
+
         AtomicInteger entriesRead = new AtomicInteger(0);
         // here do the real read, and in read callback put cursor back to KafkaTopicConsumerManager.
-        Map<TopicPartition, CompletableFuture<Entry>> readFutures = readAllCursorOnce(cursors);
+        Map<TopicPartition, CompletableFuture<List<Entry>>> readFutures = readAllCursorOnce(cursors);
         CompletableFuture.allOf(readFutures.values().stream().toArray(CompletableFuture<?>[]::new))
             .whenComplete((ignore, ex) -> {
+
+                FetchRequest request = (FetchRequest) fetch.getRequest();
+                IsolationLevel isolationLevel = request.isolationLevel();
+
                 // keep entries since all read completed.
                 readFutures.entrySet().parallelStream().forEach(kafkaTopicReadEntry -> {
                     TopicPartition kafkaTopic = kafkaTopicReadEntry.getKey();
-                    CompletableFuture<Entry> readEntry = kafkaTopicReadEntry.getValue();
+                    CompletableFuture<List<Entry>> readEntry = kafkaTopicReadEntry.getValue();
                     try {
-                        Entry entry = readEntry.get();
+                        List<Entry> entries = readEntry.get();
                         List<Entry> entryList = responseValues.computeIfAbsent(kafkaTopic, l -> Lists.newArrayList());
 
-                        if (entry != null) {
-                            entryList.add(entry);
-                            entriesRead.incrementAndGet();
-                            bytesRead.addAndGet(entry.getLength());
+                        if (entries != null && !entries.isEmpty()) {
+                            if (isolationLevel.equals(IsolationLevel.READ_UNCOMMITTED)) {
+                                entryList.addAll(entries);
+                                entriesRead.addAndGet(entries.size());
+                                bytesRead.addAndGet(entryList.stream().parallel().map(e ->
+                                        e.getLength()).reduce(0, Integer::sum));
+                            } else {
+                                TopicName topicName = TopicName.get(KopTopic.toString(kafkaTopic));
+                                long lso = tc.getLastStableOffset(topicName);
+                                for (Entry entry : entries) {
+                                    if (lso >= MessageIdUtils.peekBaseOffsetFromEntry(entry)) {
+                                        entryList.add(entry);
+                                        entriesRead.incrementAndGet();
+                                        bytesRead.addAndGet(entry.getLength());
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+
                             if (log.isDebugEnabled()) {
-                                log.debug("Request {}: For topic {}, entries in list: {}. add new entry {}:{}",
-                                    fetch.getHeader(), kafkaTopic.toString(), entryList.size(),
-                                    entry.getLedgerId(), entry.getEntryId());
+                                log.debug("Request {}: For topic {}, entries in list: {}.",
+                                        fetch.getHeader(), kafkaTopic.toString(), entryList.size());
                             }
                         }
                     } catch (Exception e) {
@@ -221,9 +249,8 @@ public final class MessageFetchContext {
                             fetch.getHeader(), kafkaTopic, e);
 
                         // delete related cursor in TCM
-                        TopicName pulsarTopicName = pulsarTopicName(kafkaTopic, requestHandler.getNamespace());
                         requestHandler.getTopicManager()
-                            .getTopicConsumerManager(pulsarTopicName.toString())
+                            .getTopicConsumerManager(KopTopic.toString(kafkaTopic))
                             .thenAccept(cm -> {
                                 // Notice, channel may be close, then TCM would be null.
                                 if (cm != null) {
@@ -231,6 +258,9 @@ public final class MessageFetchContext {
                                         cursors.get(kafkaTopic).getLeft(),
                                         "cursor.readEntry fail. deleteCursor");
                                 } else {
+                                    // remove null future cache from consumerTopicManagers
+                                    requestHandler.getTopicManager().getConsumerTopicManagers()
+                                            .remove(KopTopic.toString(kafkaTopic));
                                     log.warn("Cursor deleted while TCM close.");
                                 }
                             });
@@ -248,7 +278,6 @@ public final class MessageFetchContext {
                     }
                 });
 
-                FetchRequest request = (FetchRequest) fetch.getRequest();
                 int maxBytes = request.maxBytes();
                 int minBytes = request.minBytes();
                 int waitTime = request.maxWait(); // in ms
@@ -276,21 +305,22 @@ public final class MessageFetchContext {
                             fetch.getHeader(), entriesRead.get(), allSize);
                     }
 
-                    AtomicBoolean allPartitionsNoEntry = new AtomicBoolean(true);
-                    responseValues.entrySet().parallelStream().forEach(responseEntrys -> {
+                    responseValues.entrySet().forEach(responseEntries -> {
                         final PartitionData partitionData;
-                        TopicPartition kafkaPartition = responseEntrys.getKey();
-                        List<Entry> entries = responseEntrys.getValue();
+                        TopicPartition kafkaPartition = responseEntries.getKey();
+                        List<Entry> entries = responseEntries.getValue();
                         // Add cursor and offset back to TCM when all the read completed.
-                        TopicName pulsarTopicName = pulsarTopicName(kafkaPartition, requestHandler.getNamespace());
                         Pair<ManagedCursor, Long> pair = cursors.get(kafkaPartition);
                         requestHandler.getTopicManager()
-                            .getTopicConsumerManager(pulsarTopicName.toString())
+                            .getTopicConsumerManager(KopTopic.toString(kafkaPartition))
                             .thenAccept(cm -> {
                                 // Notice, channel may be close, then TCM would be null.
                                 if (cm != null) {
                                     cm.add(pair.getRight(), pair);
                                 } else {
+                                    // remove null future cache from consumerTopicManagers
+                                    requestHandler.getTopicManager().getConsumerTopicManagers()
+                                            .remove(KopTopic.toString(kafkaPartition));
                                     log.warn("Cursor deleted while TCM close, failed to add cursor back to TCM.");
                                 }
                             });
@@ -304,122 +334,126 @@ public final class MessageFetchContext {
                                 null,
                                 MemoryRecords.EMPTY);
                         } else {
-                            allPartitionsNoEntry.set(false);
-                            Entry entry = entries.get(entries.size() - 1);
-                            long entryOffset = MessageIdUtils.getOffset(entry.getLedgerId(), entry.getEntryId());
-                            long highWatermark = entryOffset
-                                + cursors.get(kafkaPartition).getLeft().getNumberOfEntries();
+                            ManagedLedgerImpl managedLedger = (ManagedLedgerImpl) cursors
+                                    .get(kafkaPartition).getLeft().getManagedLedger();
+                            long highWatermark = MessageIdUtils.getHighWatermark(managedLedger);
 
-                            // by default kafka is produced message in batched mode.
-                            MemoryRecords records;
-                            records = entriesToRecords(entries);
+                            // use compatible magic value by apiVersion
+                            short apiVersion = fetch.getHeader().apiVersion();
+                            byte magic = RecordBatch.CURRENT_MAGIC_VALUE;
+                            if (apiVersion <= 1) {
+                                magic = RecordBatch.MAGIC_VALUE_V0;
+                            } else if (apiVersion <= 3) {
+                                magic = RecordBatch.MAGIC_VALUE_V1;
+                            }
+                            // get group and consumer
+                            String clientHost = fetch.getClientHost();
+                            String groupName = requestHandler
+                                    .getCurrentConnectedGroup().computeIfAbsent(clientHost, ignored -> {
+                                String zkSubPath = ZooKeeperUtils.groupIdPathFormat(clientHost,
+                                        fetch.getHeader().clientId());
+                                String groupId = ZooKeeperUtils.getData(requestHandler.getPulsarService().getZkClient(),
+                                        requestHandler.getGroupIdStoredPath(), zkSubPath);
+                                log.info("get group name from zk for current connection:{} groupId:{}",
+                                        clientHost, groupId);
+                                return groupId;
+                            });
+                            CompletableFuture<Consumer> consumerFuture = requestHandler.getTopicManager()
+                                    .getGroupConsumers(groupName, kafkaPartition);
+                            final MemoryRecords records = requestHandler.getEntryFormatter().decode(entries, magic);
+                            // collect consumer metrics
+                            EntryFormatter.updateConsumerStats(records, consumerFuture);
 
+                            List<FetchResponse.AbortedTransaction> abortedTransactions;
+                            if (IsolationLevel.READ_UNCOMMITTED.equals(isolationLevel)) {
+                                abortedTransactions = null;
+                            } else {
+                                abortedTransactions = tc.getAbortedIndexList(
+                                        request.fetchData().get(kafkaPartition).fetchOffset);
+                            }
                             partitionData = new FetchResponse.PartitionData(
                                 Errors.NONE,
                                 highWatermark,
                                 highWatermark,
                                 highWatermark,
-                                null,
+                                abortedTransactions,
                                 records);
                         }
                         responseData.put(kafkaPartition, partitionData);
                     });
 
-                    if (allPartitionsNoEntry.get()) {
-                        if (log.isDebugEnabled()) {
-                            log.debug("Request {}: All partitions for request read 0 entry",
-                                fetch.getHeader());
-                        }
-
-                        requestHandler.getPulsarService().getExecutor().schedule(() -> {
-                            resultFuture.complete(
-                                new FetchResponse(Errors.NONE,
+                    resultFuture.complete(
+                            new FetchResponse(
+                                    Errors.NONE,
                                     responseData,
                                     ((Integer) THROTTLE_TIME_MS.defaultValue),
                                     ((FetchRequest) fetch.getRequest()).metadata().sessionId()));
-                            this.recycle();
-                        }, waitTime, TimeUnit.MILLISECONDS);
-                    } else {
-                        resultFuture.complete(
-                            new FetchResponse(
-                                Errors.NONE,
-                                responseData,
-                                ((Integer) THROTTLE_TIME_MS.defaultValue),
-                                ((FetchRequest) fetch.getRequest()).metadata().sessionId()));
-                        this.recycle();
-                    }
+                    this.recycle();
                 } else {
                     if (log.isDebugEnabled()) {
                         log.debug("Request {}: Read time or size not reach, do another round of read before return.",
                             fetch.getHeader());
                     }
                     // need do another round read
-                    readMessagesInternal(fetch, cursors, bytesRead, responseValues, resultFuture, responseData);
+                    readMessagesInternal(fetch, cursors, bytesRead, responseValues, resultFuture, responseData, tc);
                 }
             });
     }
 
-    private Map<TopicPartition, CompletableFuture<Entry>> readAllCursorOnce(
+    private Map<TopicPartition, CompletableFuture<List<Entry>>> readAllCursorOnce(
         Map<TopicPartition, Pair<ManagedCursor, Long>> cursors) {
-        Map<TopicPartition, CompletableFuture<Entry>> readFutures = new ConcurrentHashMap<>();
+        Map<TopicPartition, CompletableFuture<List<Entry>>> readFutures = new ConcurrentHashMap<>();
 
-        cursors.entrySet().forEach(cursorOffsetPair -> {
+        cursors.entrySet().parallelStream().forEach(cursorOffsetPair -> {
             ManagedCursor cursor;
-            CompletableFuture<Entry> readFuture = new CompletableFuture<>();
-
+            CompletableFuture<List<Entry>> readFuture = new CompletableFuture<>();
             cursor = cursorOffsetPair.getValue().getLeft();
             long currentOffset = cursorOffsetPair.getValue().getRight();
+            int readeEntryNum = requestHandler.getMaxReadEntriesNum();
 
-            // only read 1 entry currently.
-            cursor.asyncReadEntries(1,
-                new ReadEntriesCallback() {
-                    @Override
-                    public void readEntriesComplete(List<Entry> list, Object o) {
-                        TopicName topicName = pulsarTopicName(
-                            cursorOffsetPair.getKey(),
-                            requestHandler.getNamespace());
+            // read readeEntryNum size entry.
+            cursor.asyncReadEntries(readeEntryNum,
+                    new ReadEntriesCallback() {
+                        @Override
+                        public void readEntriesComplete(List<Entry> list, Object o) {
+                            String fullPartitionName = KopTopic.toString(cursorOffsetPair.getKey());
 
-                        Entry entry = null;
-                        if (!list.isEmpty()) {
-                            entry = list.get(0);
-                            long offset = MessageIdUtils.getOffset(entry.getLedgerId(), entry.getEntryId());
-                            PositionImpl currentPosition = PositionImpl
-                                .get(entry.getLedgerId(), entry.getEntryId());
+                            if (!list.isEmpty()) {
+                                StreamSupport.stream(list.spliterator(), true).forEachOrdered(entry -> {
+                                    long offset = MessageIdUtils.peekOffsetFromEntry(entry);
+                                    PositionImpl currentPosition = PositionImpl
+                                            .get(entry.getLedgerId(), entry.getEntryId());
 
-                            // commit the offset, so backlog not affect by this cursor.
-                            commitOffset((NonDurableCursorImpl) cursor, currentPosition);
+                                    // commit the offset, so backlog not affect by this cursor.
+                                    commitOffset((NonDurableCursorImpl) cursor, currentPosition);
 
-                            // get next offset
-                            PositionImpl nextPosition = ((NonDurableCursorImpl) cursor)
-                                .getNextAvailablePosition(currentPosition);
+                                    long nextOffset = offset + 1;
 
-                            long nextOffset = MessageIdUtils
-                                .getOffset(nextPosition.getLedgerId(), nextPosition.getEntryId());
+                                    // put next offset in to passed in cursors map.
+                                    // and add back to TCM when all read complete.
+                                    cursors.put(cursorOffsetPair.getKey(), Pair.of(cursor, nextOffset));
 
-                            // put next offset in to passed in cursors map. and add back to TCM when all read complete.
-                            cursors.put(cursorOffsetPair.getKey(), Pair.of(cursor, nextOffset));
-
-                            if (log.isDebugEnabled()) {
-                                log.debug("Topic {} success read entry: ledgerId: {}, entryId: {}, size: {},"
-                                        + " ConsumerManager original offset: {}, entryOffset: {} - {}, "
-                                        + "nextOffset: {} - {}",
-                                    topicName.toString(), entry.getLedgerId(), entry.getEntryId(),
-                                    entry.getLength(), currentOffset, offset, currentPosition,
-                                    nextOffset, nextPosition);
+                                    if (log.isDebugEnabled()) {
+                                        log.debug("Topic {} success read entry: ledgerId: {}, entryId: {}, size: {},"
+                                                        + " ConsumerManager original offset: {}, entryOffset: {} - {}, "
+                                                        + "nextOffset: {}",
+                                                fullPartitionName, entry.getLedgerId(), entry.getEntryId(),
+                                                entry.getLength(), currentOffset, offset, currentPosition,
+                                                nextOffset);
+                                    }
+                                });
                             }
-                        }
 
-                        readFuture.complete(entry);
-                    }
+                            readFuture.complete(list);
+                        }
 
                     @Override
                     public void readEntriesFailed(ManagedLedgerException e, Object o) {
-                        log.error("Error read entry for topic: {}",
-                            pulsarTopicName(cursorOffsetPair.getKey(), requestHandler.getNamespace()));
+                        log.error("Error read entry for topic: {}", KopTopic.toString(cursorOffsetPair.getKey()));
 
                         readFuture.completeExceptionally(e);
                     }
-                }, null);
+                }, null, PositionImpl.latest);
 
             readFutures.putIfAbsent(cursorOffsetPair.getKey(), readFuture);
         });

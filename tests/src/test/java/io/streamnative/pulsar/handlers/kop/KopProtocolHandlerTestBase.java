@@ -13,8 +13,6 @@
  */
 package io.streamnative.pulsar.handlers.kop;
 
-import static io.streamnative.pulsar.handlers.kop.KafkaProtocolHandler.PLAINTEXT_PREFIX;
-import static io.streamnative.pulsar.handlers.kop.KafkaProtocolHandler.SSL_PREFIX;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.spy;
 
@@ -22,19 +20,25 @@ import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
+import io.confluent.kafka.schemaregistry.avro.AvroCompatibilityLevel;
+import io.confluent.kafka.schemaregistry.rest.SchemaRegistryConfig;
+import io.confluent.kafka.schemaregistry.rest.SchemaRegistryRestApplication;
 import io.streamnative.pulsar.handlers.kop.utils.MetadataUtils;
 
 import java.io.Closeable;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -46,6 +50,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.EnsemblePlacementPolicy;
 import org.apache.bookkeeper.client.PulsarMockBookKeeper;
+import org.apache.bookkeeper.stats.StatsLogger;
 import org.apache.bookkeeper.util.ZkUtils;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -54,6 +59,7 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.errors.SerializationException;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
 import org.apache.kafka.common.serialization.IntegerSerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.pulsar.broker.BookKeeperClientFactory;
@@ -65,12 +71,14 @@ import org.apache.pulsar.client.admin.PulsarAdmin;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.compaction.Compactor;
+import org.apache.pulsar.metadata.impl.ZKMetadataStore;
 import org.apache.pulsar.zookeeper.ZooKeeperClientFactory;
 import org.apache.pulsar.zookeeper.ZookeeperClientFactoryImpl;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.MockZooKeeper;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.data.ACL;
+import org.eclipse.jetty.server.Server;
 
 /**
  * Unit test to test KoP handler.
@@ -94,6 +102,8 @@ public abstract class KopProtocolHandlerTestBase {
     protected int kafkaBrokerPort = PortManager.nextFreePort();
     @Getter
     protected int kafkaBrokerPortTls = PortManager.nextFreePort();
+    @Getter
+    protected int kafkaSchemaRegistryPort = PortManager.nextFreePort();
 
     protected MockZooKeeper mockZooKeeper;
     protected NonClosableMockBookKeeper mockBookKeeper;
@@ -106,12 +116,35 @@ public abstract class KopProtocolHandlerTestBase {
     private SameThreadOrderedSafeExecutor sameThreadOrderedSafeExecutor;
     private ExecutorService bkExecutor;
 
+    // Fields about Confluent Schema Registry
+    protected boolean enableSchemaRegistry = false;
+    private static final String KAFKASTORE_TOPIC = SchemaRegistryConfig.DEFAULT_KAFKASTORE_TOPIC;
+    protected SchemaRegistryRestApplication restApp;
+    protected Server restServer;
+    protected String restConnect;
+
+    private final String entryFormat;
+
+    protected static final String PLAINTEXT_PREFIX = SecurityProtocol.PLAINTEXT.name() + "://";
+    protected static final String SSL_PREFIX = SecurityProtocol.SSL.name() + "://";
+
     public KopProtocolHandlerTestBase() {
+        this.entryFormat = "pulsar";
         resetConfig();
+    }
+
+    public KopProtocolHandlerTestBase(final String entryFormat) {
+        this.entryFormat = entryFormat;
+        resetConfig();
+    }
+
+    protected EndPoint getPlainEndPoint() {
+        return new EndPoint(PLAINTEXT_PREFIX + "127.0.0.1:" + kafkaBrokerPort);
     }
 
     protected void resetConfig() {
         KafkaServiceConfiguration kafkaConfig = new KafkaServiceConfiguration();
+        addBrokerEntryMetadataInterceptors(kafkaConfig);
         kafkaConfig.setBrokerServicePort(Optional.ofNullable(brokerPort));
         kafkaConfig.setAdvertisedAddress("localhost");
         kafkaConfig.setWebServicePort(Optional.ofNullable(brokerWebservicePort));
@@ -127,7 +160,7 @@ public abstract class KopProtocolHandlerTestBase {
         kafkaConfig.setAuthenticationEnabled(false);
         kafkaConfig.setAuthorizationEnabled(false);
         kafkaConfig.setAllowAutoTopicCreation(true);
-        kafkaConfig.setAllowAutoTopicCreationType("non-partitioned");
+        kafkaConfig.setAllowAutoTopicCreationType("partitioned");
         kafkaConfig.setBrokerDeleteInactiveTopicsEnabled(false);
 
         kafkaConfig.setKafkaMetadataTenant(tenant);
@@ -136,9 +169,10 @@ public abstract class KopProtocolHandlerTestBase {
         // kafka related settings.
         kafkaConfig.setEnableGroupCoordinator(true);
         kafkaConfig.setOffsetsTopicNumPartitions(1);
-        kafkaConfig.setListeners(
-            PLAINTEXT_PREFIX + "localhost:" + kafkaBrokerPort + ","
-                + SSL_PREFIX + "localhost:" + kafkaBrokerPortTls);
+        kafkaConfig.setKafkaListeners(
+                PLAINTEXT_PREFIX + "localhost:" + kafkaBrokerPort + ","
+                        + SSL_PREFIX + "localhost:" + kafkaBrokerPortTls);
+        kafkaConfig.setEntryFormat(entryFormat);
 
         // set protocol related config
         URL testHandlerUrl = this.getClass().getClassLoader().getResource("test-protocol-handler.nar");
@@ -201,12 +235,38 @@ public abstract class KopProtocolHandlerTestBase {
         createAdmin();
 
         MetadataUtils.createKafkaMetadataIfMissing(admin, this.conf);
+
+        if (enableSchemaRegistry) {
+            admin.topics().createPartitionedTopic(KAFKASTORE_TOPIC, 1);
+            final Properties props = new Properties();
+            props.put(SchemaRegistryConfig.PORT_CONFIG, Integer.toString(getKafkaSchemaRegistryPort()));
+            // Increase the kafkastore.timeout.ms (default: 500) to avoid test failure in CI
+            props.put(SchemaRegistryConfig.KAFKASTORE_TIMEOUT_CONFIG, 3000);
+            // NOTE: KoP doesn't support kafkastore.connection.url
+            props.put(SchemaRegistryConfig.KAFKASTORE_BOOTSTRAP_SERVERS_CONFIG,
+                    "PLAINTEXT://localhost:" + getKafkaBrokerPort());
+            props.put(SchemaRegistryConfig.KAFKASTORE_TOPIC_CONFIG, KAFKASTORE_TOPIC);
+            props.put(SchemaRegistryConfig.COMPATIBILITY_CONFIG, AvroCompatibilityLevel.NONE.name);
+            props.put(SchemaRegistryConfig.MASTER_ELIGIBILITY, true);
+
+            restApp = new SchemaRegistryRestApplication(props);
+            restServer = restApp.createServer();
+            restServer.start();
+            restConnect = restServer.getURI().toString();
+            if (restConnect.endsWith("/")) {
+                restConnect = restConnect.substring(0, restConnect.length() - 1);
+            }
+        }
     }
 
     protected final void internalCleanup() throws Exception {
         try {
             // if init fails, some of these could be null, and if so would throw
             // an NPE in shutdown, obscuring the real error
+            if (restServer != null) {
+                restServer.stop();
+                restServer.join();
+            }
             if (admin != null) {
                 admin.close();
             }
@@ -252,8 +312,8 @@ public abstract class KopProtocolHandlerTestBase {
     }
 
     protected PulsarService startBroker(ServiceConfiguration conf) throws Exception {
+        addBrokerEntryMetadataInterceptors(conf);
         PulsarService pulsar = spy(new PulsarService(conf));
-
         setupBrokerMocks(pulsar);
         pulsar.start();
 
@@ -267,6 +327,7 @@ public abstract class KopProtocolHandlerTestBase {
         // Override default providers with mocked ones
         doReturn(mockZooKeeperClientFactory).when(pulsar).getZooKeeperClientFactory();
         doReturn(mockBookKeeperClientFactory).when(pulsar).newBookKeeperClientFactory();
+        doReturn(new ZKMetadataStore(mockZooKeeper)).when(pulsar).createLocalMetadataStore();
 
         Supplier<NamespaceService> namespaceServiceSupplier = () -> spy(new NamespaceService(pulsar));
         doReturn(namespaceServiceSupplier).when(pulsar).getNamespaceServiceProvider();
@@ -342,6 +403,13 @@ public abstract class KopProtocolHandlerTestBase {
                                  Optional<Class<? extends EnsemblePlacementPolicy>> ensemblePlacementPolicyClass,
                                  Map<String, Object> properties) {
             // Always return the same instance (so that we don't loose the mock BK content on broker restart
+            return mockBookKeeper;
+        }
+
+        @Override
+        public BookKeeper create(ServiceConfiguration serviceConfiguration, ZooKeeper zooKeeper,
+                                 Optional<Class<? extends EnsemblePlacementPolicy>> optional,
+                                 Map<String, Object> map, StatsLogger statsLogger) throws IOException {
             return mockBookKeeper;
         }
 
@@ -565,6 +633,12 @@ public abstract class KopProtocolHandlerTestBase {
         }
     }
 
+    public static void addBrokerEntryMetadataInterceptors(ServiceConfiguration configuration) {
+        Set<String> interceptorNames = new HashSet<>();
+        interceptorNames.add("org.apache.pulsar.common.intercept.AppendBrokerTimestampMetadataInterceptor");
+        interceptorNames.add("org.apache.pulsar.common.intercept.AppendIndexMetadataInterceptor");
+        configuration.setBrokerEntryMetadataInterceptors(interceptorNames);
+    }
 
     public static Integer kafkaIntDeserialize(byte[] data) {
         if (data == null) {

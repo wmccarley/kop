@@ -19,6 +19,7 @@ import static io.streamnative.pulsar.handlers.kop.utils.TopicNameUtils.getPartit
 import static org.apache.pulsar.common.naming.TopicName.PARTITIONED_TOPIC_SUFFIX;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
 
 import com.google.common.collect.Sets;
 import io.netty.buffer.ByteBuf;
@@ -26,22 +27,62 @@ import io.netty.buffer.Unpooled;
 import io.streamnative.pulsar.handlers.kop.KafkaCommandDecoder.KafkaHeaderAndRequest;
 import io.streamnative.pulsar.handlers.kop.KafkaCommandDecoder.KafkaHeaderAndResponse;
 import io.streamnative.pulsar.handlers.kop.coordinator.group.GroupCoordinator;
+import io.streamnative.pulsar.handlers.kop.coordinator.group.GroupMetadata;
+import io.streamnative.pulsar.handlers.kop.coordinator.group.GroupMetadataManager;
+import io.streamnative.pulsar.handlers.kop.coordinator.transaction.TransactionCoordinator;
+import io.streamnative.pulsar.handlers.kop.offset.OffsetAndMetadata;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
+
+import lombok.Cleanup;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.Node;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigResource;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.errors.UnknownServerException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
+import org.apache.kafka.common.requests.AbstractResponse;
 import org.apache.kafka.common.requests.ApiVersionsRequest;
 import org.apache.kafka.common.requests.ApiVersionsResponse;
 import org.apache.kafka.common.requests.MetadataResponse.PartitionMetadata;
+import org.apache.kafka.common.requests.OffsetCommitRequest;
 import org.apache.kafka.common.requests.RequestHeader;
 import org.apache.kafka.common.requests.ResponseHeader;
+import org.apache.kafka.common.serialization.IntegerSerializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.utils.Time;
 import org.apache.pulsar.broker.protocol.ProtocolHandler;
+import org.apache.pulsar.client.admin.PulsarAdminException;
+import org.apache.pulsar.common.allocator.PulsarByteBufAllocator;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.RetentionPolicies;
 import org.apache.pulsar.common.policies.data.TenantInfo;
+import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -89,16 +130,23 @@ public class KafkaRequestHandlerTest extends KopProtocolHandlerTestBase {
                 new RetentionPolicies(-1, -1));
         }
 
+        admin.tenants().createTenant("my-tenant",
+                new TenantInfo(Sets.newHashSet(), Sets.newHashSet(super.configClusterName)));
+        admin.namespaces().createNamespace("my-tenant/my-ns");
+
         log.info("created namespaces, init handler");
 
         ProtocolHandler handler1 = pulsar.getProtocolHandlers().protocol("kafka");
         GroupCoordinator groupCoordinator = ((KafkaProtocolHandler) handler1).getGroupCoordinator();
+        TransactionCoordinator transactionCoordinator = ((KafkaProtocolHandler) handler1).getTransactionCoordinator();
 
         handler = new KafkaRequestHandler(
             pulsar,
             (KafkaServiceConfiguration) conf,
             groupCoordinator,
-            false);
+            transactionCoordinator,
+            false,
+            getPlainEndPoint());
     }
 
     @AfterMethod
@@ -237,5 +285,323 @@ public class KafkaRequestHandlerTest extends KopProtocolHandlerTestBase {
 
         assertEquals(localName, getKafkaTopicNameFromPulsarTopicname(topicName));
         assertEquals(localName, getKafkaTopicNameFromPulsarTopicname(topicNamePartition));
+    }
+
+    private void createTopicsByKafkaAdmin(AdminClient admin, Map<String, Integer> topicToNumPartitions)
+            throws ExecutionException, InterruptedException {
+        final short replicationFactor = 1; // replication factor will be ignored
+        admin.createTopics(topicToNumPartitions.entrySet().stream().map(entry -> {
+            final String topic = entry.getKey();
+            final int numPartitions = entry.getValue();
+            return new NewTopic(topic, numPartitions, replicationFactor);
+        }).collect(Collectors.toList())).all().get();
+    }
+
+    private void verifyTopicsCreatedByPulsarAdmin(Map<String, Integer> topicToNumPartitions)
+            throws PulsarAdminException {
+        for (Map.Entry<String, Integer> entry : topicToNumPartitions.entrySet()) {
+            final String topic = entry.getKey();
+            final int numPartitions = entry.getValue();
+            assertEquals(this.admin.topics().getPartitionedTopicMetadata(topic).partitions, numPartitions);
+        }
+    }
+
+    private void verifyTopicsDeletedByPulsarAdmin(Map<String, Integer> topicToNumPartitions)
+            throws PulsarAdminException {
+        for (Map.Entry<String, Integer> entry : topicToNumPartitions.entrySet()) {
+            final String topic = entry.getKey();
+            assertEquals(this.admin.topics().getPartitionedTopicMetadata(topic).partitions, 0);
+        }
+    }
+
+    private void deleteTopicsByKafkaAdmin(AdminClient admin, Set<String> topicsToDelete)
+            throws ExecutionException, InterruptedException {
+        admin.deleteTopics(topicsToDelete).all().get();
+    }
+
+
+    @Test(timeOut = 10000)
+    public void testCreateAndDeleteTopics() throws Exception {
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:" + getKafkaBrokerPort());
+
+        @Cleanup
+        AdminClient kafkaAdmin = AdminClient.create(props);
+        Map<String, Integer> topicToNumPartitions = new HashMap<String, Integer>(){{
+            put("testCreateTopics-0", 1);
+            put("testCreateTopics-1", 3);
+            put("my-tenant/my-ns/testCreateTopics-2", 1);
+            put("persistent://my-tenant/my-ns/testCreateTopics-3", 5);
+        }};
+        // create
+        createTopicsByKafkaAdmin(kafkaAdmin, topicToNumPartitions);
+        verifyTopicsCreatedByPulsarAdmin(topicToNumPartitions);
+        // delete
+        deleteTopicsByKafkaAdmin(kafkaAdmin, topicToNumPartitions.keySet());
+        verifyTopicsDeletedByPulsarAdmin(topicToNumPartitions);
+    }
+
+    @Test(timeOut = 10000)
+    public void testCreateInvalidTopics() {
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:" + getKafkaBrokerPort());
+        props.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, 5000);
+
+        @Cleanup
+        AdminClient kafkaAdmin = AdminClient.create(props);
+        Map<String, Integer> topicToNumPartitions = new HashMap<String, Integer>(){{
+            put("xxx/testCreateInvalidTopics-0", 1);
+        }};
+        try {
+            createTopicsByKafkaAdmin(kafkaAdmin, topicToNumPartitions);
+            fail("create a invalid topic should fail");
+        } catch (Exception e) {
+            log.info("Failed to create topics: {} caused by {}", topicToNumPartitions, e.getCause());
+            final Throwable cause = e.getCause();
+            assertTrue(cause instanceof TimeoutException || cause instanceof UnknownServerException);
+        }
+    }
+
+    @Test(timeOut = 10000)
+    public void testDeleteNotExistedTopics() throws Exception {
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:" + getKafkaBrokerPort());
+
+        @Cleanup
+        AdminClient kafkaAdmin = AdminClient.create(props);
+        Set<String> topics = new HashSet<>();
+        topics.add("testDeleteNotExistedTopics");
+        try {
+            deleteTopicsByKafkaAdmin(kafkaAdmin, topics);
+            fail();
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof UnknownTopicOrPartitionException);
+        }
+    }
+
+    @Test(timeOut = 10000)
+    public void testDescribeTopics() throws Exception {
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:" + getKafkaBrokerPort());
+        props.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, 5000);
+
+        @Cleanup
+        AdminClient kafkaAdmin = AdminClient.create(props);
+
+        final String topicNotExisted = "testDescribeTopics-topic-not-existed";
+        try {
+            kafkaAdmin.describeTopics(new HashSet<>(Collections.singletonList(topicNotExisted))).all().get();
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof UnknownTopicOrPartitionException);
+        }
+
+        final Map<String, Integer> expectedTopicPartitions = new HashMap<String, Integer>() {{
+            put("testDescribeTopics-topic-1", 1);
+            put("testDescribeTopics-topic-2", 3);
+        }};
+        for (Map.Entry<String, Integer> entry : expectedTopicPartitions.entrySet()) {
+            admin.topics().createPartitionedTopic(entry.getKey(), entry.getValue());
+        }
+
+        final Map<String, Integer> result = kafkaAdmin
+                .describeTopics(expectedTopicPartitions.keySet())
+                .all().get().entrySet().stream().collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        entry -> entry.getValue().partitions().size()
+                ));
+        assertEquals(result, expectedTopicPartitions);
+    }
+
+    @Test(timeOut = 10000)
+    public void testDescribeConfigs() throws Exception {
+        final String topic = "testDescribeConfigs";
+        admin.topics().createPartitionedTopic(topic, 1);
+
+        Properties props = new Properties();
+        props.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:" + getKafkaBrokerPort());
+
+        @Cleanup
+        AdminClient kafkaAdmin = AdminClient.create(props);
+        final Map<String, String> entries = KafkaLogConfig.getEntries();
+
+        kafkaAdmin.describeConfigs(Collections.singletonList(new ConfigResource(ConfigResource.Type.TOPIC, topic)))
+                .all().get().forEach((resource, config) -> {
+            assertEquals(resource.name(), topic);
+            config.entries().forEach(entry -> assertEquals(entry.value(), entries.get(entry.name())));
+        });
+
+        final String invalidTopic = "invalid-topic";
+        try {
+            kafkaAdmin.describeConfigs(Collections.singletonList(
+                    new ConfigResource(ConfigResource.Type.TOPIC, invalidTopic))).all().get();
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof UnknownTopicOrPartitionException);
+            assertTrue(e.getMessage().contains("Topic " + invalidTopic + " doesn't exist"));
+        }
+    }
+
+    @Test(timeOut = 10000)
+    public void testProduceCallback() throws Exception {
+        final String topic = "test-produce-callback";
+        final int numMessages = 10;
+        final String messagePrefix = "msg-";
+
+        final Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:" + getKafkaBrokerPort());
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+
+        @Cleanup
+        KafkaProducer<Integer, String> producer = new KafkaProducer<>(props);
+
+        final CountDownLatch latch = new CountDownLatch(numMessages);
+        final List<Long> offsets = new ArrayList<>();
+        for (int i = 0; i < numMessages; i++) {
+            final int index = i;
+            Future<RecordMetadata> future = producer.send(new ProducerRecord<>(topic, i, messagePrefix + i),
+                    (recordMetadata, e) -> {
+                        if (e != null) {
+                            log.error("Failed to send {}: {}", index, e);
+                            offsets.add(-1L);
+                        } else {
+                            offsets.add(recordMetadata.offset());
+                        }
+                        latch.countDown();
+                    });
+            // The first half messages are sent in batch, the second half messages are sent synchronously.
+            if (i >= numMessages / 2) {
+                future.get();
+            }
+        }
+        latch.await();
+        final List<Long> expectedOffsets = LongStream.range(0, numMessages).boxed().collect(Collectors.toList());
+        log.info("Actual offsets: {}", offsets);
+        assertEquals(offsets, expectedOffsets);
+    }
+
+    @Test(timeOut = 10000)
+    public void testConvertOffsetCommitRetentionMsIfSetDefaultValue() throws Exception {
+
+        String memberId = "test_member_id";
+        int generationId = 0;
+        long currentTime = 100;
+        int configRetentionMs = 1000;
+        TopicPartition topicPartition = new TopicPartition("test", 1);
+
+        // build input params
+        Map<TopicPartition, OffsetCommitRequest.PartitionData> offsetData = new HashMap<>();
+        offsetData.put(topicPartition,
+                new OffsetCommitRequest.PartitionData(1L, ""));
+        OffsetCommitRequest.Builder builder = new OffsetCommitRequest.Builder("test-groupId", offsetData)
+                .setGenerationId(generationId)
+                .setMemberId(memberId)
+                .setRetentionTime(OffsetCommitRequest.DEFAULT_RETENTION_TIME);
+        OffsetCommitRequest offsetCommitRequest = builder.build();
+
+
+        // convert
+        Map<TopicPartition, OffsetAndMetadata> converted =
+                handler.convertOffsetCommitRequestRetentionMs(offsetCommitRequest,
+                builder.latestAllowedVersion(),
+                currentTime,
+                configRetentionMs);
+
+        OffsetAndMetadata convertedOffsetAndMetadata = converted.get(topicPartition);
+
+        // verify
+        Assert.assertEquals(convertedOffsetAndMetadata.commitTimestamp(), currentTime);
+        Assert.assertEquals(convertedOffsetAndMetadata.expireTimestamp(), currentTime + configRetentionMs);
+
+    }
+
+    @Test(timeOut = 10000)
+    public void testConvertOffsetCommitRetentionMsIfRetentionMsSet() throws Exception {
+
+        String memberId = "test_member_id";
+        int generationId = 0;
+        long currentTime = 100;
+        int offsetsConfigRetentionMs = 1000;
+        int requestSetRetentionMs = 10000;
+        TopicPartition topicPartition = new TopicPartition("test", 1);
+
+        // build input params
+        Map<TopicPartition, OffsetCommitRequest.PartitionData> offsetData = new HashMap<>();
+        offsetData.put(topicPartition,
+                new OffsetCommitRequest.PartitionData(1L, ""));
+        OffsetCommitRequest.Builder builder = new OffsetCommitRequest.Builder("test-groupId", offsetData)
+                .setGenerationId(generationId)
+                .setMemberId(memberId)
+                .setRetentionTime(requestSetRetentionMs);
+        OffsetCommitRequest offsetCommitRequest = builder.build();
+
+
+        // convert
+        Map<TopicPartition, OffsetAndMetadata> converted =
+                handler.convertOffsetCommitRequestRetentionMs(offsetCommitRequest,
+                builder.latestAllowedVersion(),
+                currentTime,
+                offsetsConfigRetentionMs);
+
+        OffsetAndMetadata convertedOffsetAndMetadata = converted.get(topicPartition);
+
+        // verify
+        Assert.assertEquals(convertedOffsetAndMetadata.commitTimestamp(), currentTime);
+        Assert.assertEquals(convertedOffsetAndMetadata.expireTimestamp(), currentTime + requestSetRetentionMs);
+
+    }
+
+    // test for
+    // https://github.com/streamnative/kop/issues/303
+    @Test(timeOut = 10000)
+    public void testOffsetCommitRequestRetentionMs() throws Exception {
+        String group = "test-groupId";
+        String memberId = "test_member_id";
+        int generationId = -1; // use for avoid mock group state and member
+        TopicPartition topicPartition = new TopicPartition("test", 1);
+
+        // build input params
+        Map<TopicPartition, OffsetCommitRequest.PartitionData> offsetData = new HashMap<>();
+        offsetData.put(topicPartition,
+                new OffsetCommitRequest.PartitionData(1L, ""));
+        OffsetCommitRequest.Builder builder = new OffsetCommitRequest.Builder("test-groupId", offsetData)
+                .setGenerationId(generationId)
+                .setMemberId(memberId)
+                .setRetentionTime(OffsetCommitRequest.DEFAULT_RETENTION_TIME);
+        OffsetCommitRequest offsetCommitRequest = builder.build();
+
+        RequestHeader header = new RequestHeader(ApiKeys.OFFSET_COMMIT, offsetCommitRequest.version(),
+                "", 0);
+        KafkaHeaderAndRequest headerAndRequest = new KafkaHeaderAndRequest(header,
+                offsetCommitRequest, PulsarByteBufAllocator.DEFAULT.heapBuffer(), null);
+
+        // handle request
+        CompletableFuture<AbstractResponse> future = new CompletableFuture<>();
+        handler.handleOffsetCommitRequest(headerAndRequest, future);
+
+        // wait for save offset
+        future.get();
+
+        // verify
+        GroupMetadataManager groupMetadataManager = handler.getGroupCoordinator().getGroupManager();
+        GroupMetadata metadata = groupMetadataManager.getGroup(group).get();
+        OffsetAndMetadata offsetAndMetadata = metadata.offset(topicPartition).get();
+
+        // offset in cache
+        Assert.assertNotNull(offsetAndMetadata);
+
+        // trigger clean expire offset logic
+        Map<TopicPartition, OffsetAndMetadata> removeExpiredOffsets =
+                metadata.removeExpiredOffsets(Time.SYSTEM.milliseconds());
+
+        // there is only one offset just saved. it should not being removed.
+        Assert.assertTrue(removeExpiredOffsets.isEmpty(),
+                "expect no expired offset. but " + removeExpiredOffsets + " expired.");
+
+        metadata = groupMetadataManager.getGroup(group).get();
+        offsetAndMetadata = metadata.offset(topicPartition).get();
+
+        // not cleanup
+        Assert.assertNotNull(offsetAndMetadata);
+
     }
 }

@@ -2,96 +2,118 @@
 
 This guide illustrates how to perform a release for kop.
 
-## Making the release
+## Naming convention
 
-The steps for releasing are as follows:
+All StreamNative repository should following the naming convention:
+
+- Branch name: `branch-X.Y.Z`
+- Tag name: `vX.Y.Z(.M)`(stable)
+- Release candidate tag: `vX.Y.Z(.M)-rc-$(date +%Y%m%d%H%M)` (unstable)
+
+`(.M)` means our internal version release number, most of our repository is an extensions/tools for apache/pulsar. To keep track of the repository is produced by which version of the apache/pulsar, we will carry the apache/pulsar version number and using the `.M` to represent our internal release version. And all repository should keep align with streamnative/pulsar.
+
+There has two type of the tags, one is stable `vX.Y.Z(.M)`, and another is unstable `vX.Y.Z(.M)-rc-$(date +%y%m%d%H%M)`. A stable tag represent this release is a verified release, and an unstable tag represent this release is not verified.
+
+## Release workflow
 
 1. Prepare for a release
 2. Create the release branch
-3. Update project version and tag
-4. Write a release note
-5. Move master branch to next version
-6. Announce the release
+3. Update the project version and pulsar version
+4. Build the artifacts
+5. Verify the artifacts
+6. Release the artifacts using streamnative-ci
+7. Write release notes
+8. Move master branch to the next version
 
 ## Steps in detail
 
+> In this section, `X.Y.Z.M` represents a specific version, e.g. `2.6.2.0`.
+
 1. Prepare for a release
 
-Create a new milestone and move the pull requests that can not
-be published in this release to the new milestone.
+   Create a new milestone and move the pull requests that can not be published in this release to the new milestone.
 
 2. Create the release branch
 
-We are going to create a branch from `master` to `branch-x.y`
-where the tag will be generated and where new fixes will be
-applied as part of the maintenance for the release. `x.y.z`
-is the version of the release.
+   ```bash
+   $ git clone git@github.com:streamnative/kop.git
+   $ cd kop
+   $ git checkout -b bump-pulsar-version
+   ```
 
-The branch needs only to be created when creating major releases,
-and not for patch releases.
+3. Update the project version and pulsar version
 
-Eg: When creating `v0.1.0` release, will be creating
-the branch `branch-0.1`, but for `v0.1.1` we
-would keep using the old `branch-0.1`.
+   ```bash
+   $ ./scripts/set-project-version.sh X.Y.Z.M
+   $ ./scripts/set-pulsar-version.sh X.Y.Z.M
+   $ git commit -m "Release X.Y.Z.M" -a
+   $ git push origin bump-pulsar-version
+   ```
 
-In these instructions, I'm referring to an fictitious release `x.y.z`.
-Change the release version in the examples accordingly with the real version.
+4. Build the artifacts
 
-It is recommended to create a fresh clone of the repository to 
-avoid any local files to interfere in the process:
+   ```bash
+   $ mvn clean install -DskipTests
+   ```
 
-```shell
-$ git clone git@github.com:streamnative/kop.git
-$ cd kop
+5. Verify the artifacts
 
-# Create a branch
-$ git checkout -b branch-x.y origin/master
+   You can run the following commands to verify it in local environment:
 
-# Create a tag
-$ git tag -u $USER@streamnative.io vx.y.z -m 'Release vx.y.z'
-```
+   ```bash
+   $ mvn checkstyle:check
+   $ mvn spotbugs:check
+   $ mvn test -DfailIfNoTests=false '-Dtest=!KafkaIntegrationTest,!DistributedClusterTest'
+   $ mvn test '-Dtest=KafkaIntegrationTest' -pl tests
+   ```
 
-3. Update project version and tag
+   See [pr-test.yml](.github/workflows/pr-test.yml) for details.
 
-In this process the maven version of the project will always be the final one.
+   Then you should push a PR to merge `branch-X.Y.Z` to `master` for running CI tests using Github Actions.
 
-```bash
-# Bump to the release version
-$ ./scripts/set-project-version.sh x.y.z
+   If the verification failed, which may be caused by the incompatibility with new Pulsar version, we need to add more commits to fix it.
 
-# Commit
-$ git commit -m 'Release x.y.z' -a
+6. Release the artifacts using streamnative-ci
 
-# Push both the branch and the tag to Github repo
-$ git push origin branch-x.y
-$ git push origin vx.y.z
-```
+   After the PR being merged to `master`, you can use streamnative-ci to release the artifacts.
 
-4. Publish a release note
+   The streamnative-ci needs the specified tag, so we need to push a tag `vX.Y.Z.M` first, as well as the branch:
 
-Check the milestone in GitHub associated with the release. 
+   ```bash
+   $ git clone git@github.com:streamnative/kop.git
+   $ cd kop
+   $ git checkout -b branch-X.Y.Z
+   $ git push origin branch-X.Y.Z
+   $ git tag vX.Y.Z.M
+   $ git push origin vX.Y.Z.M
+   ```
 
-In the released item, add the list of the most important changes 
-that happened in the release and a link to the associated milestone,
-with the complete list of all the changes. 
+   Then use streamnative-ci to release the latest KoP:
 
-Update the release draft at [the release homepage of kop](https://github.com/streamnative/kop/releases)
+   ```bash
+   $ git clone git@github.com:streamnative/streamnative-ci.git
+   $ cd streamnative-ci
+   $ git checkout release
+   $ git commit --allow-empty -m "/snbot release kop vX.Y.Z.M"
+   $ git push origin release
+   # Then, you can see the release process: https://github.com/streamnative/streamnative-ci/actions
+   ```
 
-Then the release draft, binary, and command doc will be published
- o that release automatically.
+7. Write release notes
 
-5. Move master branch to next version
+   Release notes is mainly to track the document catch up work.
 
-We need to move master version to next iteration `X + 1`.
+   You should document the following things at your release notes:
 
-```bash
-$ git checkout master
-$ ./scripts/set-project-version.sh X.(Y+1).0-SNAPSHOT
+   - Feature
+   - Bug fixed
 
-$ git commit -m 'Bumped version to 0.Y.0-SNAPSHOT' -a
-```
+8. Move master branch to the next version
 
-6. Announce the release
-
-After publishing and checking the release, work with Growth team
-to announce that a new version of kop is released.
+   ```bash
+   $ git checkout -b bump-master
+   $ ./scripts/set-project-version.sh X.Y.Z-SNAPSHOT
+   $ git commit -m 'Bump version to X.Y.Z-SNAPSHOT' -a
+   $ git push origin bump-master
+   # create a PR for this change
+   ```

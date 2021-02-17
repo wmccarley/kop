@@ -49,14 +49,17 @@ import org.testng.annotations.Test;
  * This is similar to SaslPlainTest, but the KoP SASL is not enabled.
  */
 @Slf4j
-public class PulsarAuthEnabledTest extends KopProtocolHandlerTestBase {
+public abstract class PulsarAuthEnabledTestBase extends KopProtocolHandlerTestBase {
     private static final String TENANT = "PulsarAuthEnabledTest";
     private static final String ADMIN_USER = "admin_user";
     private static final String NAMESPACE = "ns2";
-    private static final String KAFKA_TOPIC = "topic2";
-    private static final String PULSAR_TOPIC_NAME = "persistent://" + TENANT
-        + "/" + NAMESPACE + "/" + KAFKA_TOPIC;
+    private static final String SHORT_TOPIC = "topic2";
+    private static final String TOPIC = "persistent://" + TENANT + "/" + NAMESPACE + "/" + SHORT_TOPIC;
     private String adminToken;
+
+    public PulsarAuthEnabledTestBase(final String entryFormat) {
+        super(entryFormat);
+    }
 
     @BeforeClass
     @Override
@@ -100,7 +103,7 @@ public class PulsarAuthEnabledTest extends KopProtocolHandlerTestBase {
         admin.namespaces().createNamespace(TENANT + "/" + NAMESPACE);
         admin.namespaces()
             .setNamespaceReplicationClusters(TENANT + "/" + NAMESPACE, Sets.newHashSet(super.configClusterName));
-        admin.topics().createPartitionedTopic(PULSAR_TOPIC_NAME, 1);
+        admin.topics().createPartitionedTopic(TOPIC, 1);
         admin.namespaces().grantPermissionOnNamespace(TENANT + "/" + NAMESPACE, ADMIN_USER,
             Sets.newHashSet(AuthAction.consume, AuthAction.produce));
     }
@@ -119,18 +122,18 @@ public class PulsarAuthEnabledTest extends KopProtocolHandlerTestBase {
     @Test(timeOut = 40000)
     void simpleProduceAndConsumeWithPulsarAuthed() throws Exception {
         @Cleanup
-        KProducer kProducer = new KProducer(KAFKA_TOPIC, false, getKafkaBrokerPort());
+        KProducer kProducer = new KProducer(TOPIC, false, getKafkaBrokerPort());
 
         int totalMsgs = 10;
-        String messageStrPrefix = PULSAR_TOPIC_NAME + "_message_";
+        String messageStrPrefix = TOPIC + "_message_";
 
         for (int i = 0; i < totalMsgs; i++) {
             String messageStr = messageStrPrefix + i;
-            kProducer.getProducer().send(new ProducerRecord<>(KAFKA_TOPIC, i, messageStr));
+            kProducer.getProducer().send(new ProducerRecord<>(TOPIC, i, messageStr));
         }
-        KConsumer kConsumer = new KConsumer(KAFKA_TOPIC, getKafkaBrokerPort(), "DemoKafkaOnPulsarConsumer");
+        KConsumer kConsumer = new KConsumer(TOPIC, getKafkaBrokerPort(), "DemoKafkaOnPulsarConsumer");
 
-        kConsumer.getConsumer().subscribe(Collections.singleton(KAFKA_TOPIC));
+        kConsumer.getConsumer().subscribe(Collections.singleton(TOPIC));
 
         int i = 0;
         while (i < totalMsgs) {
@@ -151,8 +154,8 @@ public class PulsarAuthEnabledTest extends KopProtocolHandlerTestBase {
         Map<String, List<PartitionInfo>> result = kConsumer
             .getConsumer().listTopics(Duration.ofSeconds(1));
         assertEquals(result.size(), 1);
-        assertTrue(result.containsKey(KAFKA_TOPIC),
-            "list of topics " + result.keySet().toString() + "  does not contains " + KAFKA_TOPIC);
+        assertTrue(result.containsKey(SHORT_TOPIC),
+            "list of topics " + result.keySet().toString() + "  does not contains " + SHORT_TOPIC);
     }
 
 }
